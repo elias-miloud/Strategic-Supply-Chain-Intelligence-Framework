@@ -1,0 +1,163 @@
+import numpy as np
+import pandas as pd
+import pulp
+from pulp import LpMinimize, LpProblem, LpVariable, lpSum, LpBinary, LpStatus, value
+import logging
+from typing import Dict, Optional, Tuple
+from dataclasses import dataclass
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Location:
+    loc_id: str
+    distance_from_dispatch: float
+    volume_capacity: float
+    weight_capacity: float
+    zone: str
+    level: int
+
+
+@dataclass
+class SKUProfile:
+    sku_id: str
+    avg_daily_picks: float
+    unit_volume: float
+    unit_weight: float
+    sku_class: str
+    affinity_group: Optional[str] = None
+
+
+class WMSSlottingOptimizer:
+
+    def __init__(self, solver: str = "CBC", time_limit_seconds: int = 300,
+                 mip_gap: float = 0.02):
+        self.solver = solver
+        self.time_limit_seconds = time_limit_seconds
+        self.mip_gap = mip_gap
+        self.problem_ = None
+        self.solution_ = None
+        self.metrics_ = {}
+
+    def _compute_distance_matrix(self, locations: list[Location]) -> np.ndarray:
+        n = len(locations)
+        D = np.zeros((n, n))
+        for i, loc in enumerate(locations):
+            D[i, :] = loc.distance_from_dispatch
+        return D
+
+    def solve(self, skus: list[SKUProfile], locations: list[Location],
+              affinity_bonus: float = 0.15) -> Dict:
+        n_skus = len(skus)
+        n_locs = len(locations)
+
+        prob = LpProblem("WMS_Slotting_MIP", LpMinimize)
+        x = {
+            (i, j): LpVariable(f"x_{i}_{j}", cat=LpBinary)
+            for i in range(n_skus)
+            for j in range(n_locs)
+        }
+
+        travel_cost = lpSum(
+            skus[i].avg_daily_picks * locations[j].distance_from_dispatch * x[i, j]
+            for i in range(n_skus)
+            for j in range(n_locs)
+        )
+
+        affinity_groups = {}
+        for i, sku in enumerate(skus):
+            if sku.affinity_group:
+                affinity_groups.setdefault(sku.affinity_group, []).append(i)
+
+        affinity_penalty = 0
+        for group, members in affinity_groups.items():
+            for idx, i in enumerate(members):
+                for j_idx, j in enumerate(members):
+                    if i < j:
+                        for loc_a in range(n_locs):
+                            for loc_b in range(n_locs):
+                                if loc_a != loc_b:
+                                    dist = abs(locations[loc_a].distance_from_dispatch -
+                                               locations[loc_b].distance_from_dispatch)
+                                    affinity_penalty += affinity_bonus * dist * x[i, loc_a] * x[j, loc_b]
+
+        prob += travel_cost
+
+        for i in range(n_skus):
+            prob += lpSum(x[i, j] for j in range(n_locs)) == 1, f"assign_sku_{i}"
+
+        for j in range(n_locs):
+            prob += lpSum(x[i, j] for i in range(n_skus)) <= 1, f"capacity_loc_{j}"
+
+        for j, loc in enumerate(locations):
+            prob += (
+                lpSum(skus[i].unit_volume * x[i, j] for i in range(n_skus)) <= loc.volume_capacity,
+                f"volume_{j}",
+            )
+            prob += (
+                lpSum(skus[i].unit_weight * x[i, j] for i in range(n_skus)) <= loc.weight_capacity,
+                f"weight_{j}",
+            )
+
+        for i, sku in enumerate(skus):
+            if sku.sku_class == "A":
+                eligible = [j for j, loc in enumerate(locations) if loc.zone in ["A", "B"]]
+                prob += lpSum(x[i, j] for j in eligible) == 1, f"zone_class_A_{i}"
+
+        solver_obj = pulp.getSolver(self.solver, timeLimit=self.time_limit_seconds,
+                                     gapRel=self.mip_gap, msg=0)
+        prob.solve(solver_obj)
+
+        status = LpStatus[prob.status]
+        objective = value(prob.objective)
+        logger.info(f"MIP Status: {status} | Objective: {objective:.2f}")
+
+        assignment = {}
+        for i in range(n_skus):
+            for j in range(n_locs):
+                if value(x[i, j]) is not None and value(x[i, j]) > 0.5:
+                    assignment[skus[i].sku_id] = locations[j].loc_id
+
+        self.solution_ = assignment
+        self.metrics_ = {
+            "status": status,
+            "objective_value": objective,
+            "n_assigned": len(assignment),
+            "assignment_rate": len(assignment) / n_skus,
+        }
+        return self.metrics_
+
+    def compute_kpis(self, skus: list[SKUProfile], locations: list[Location],
+                     baseline_assignment: Optional[Dict] = None) -> pd.DataFrame:
+        if self.solution_ is None:
+            raise RuntimeError("No solution available. Run solve() first.")
+
+        loc_map = {loc.loc_id: loc for loc in locations}
+        sku_map = {sku.sku_id: sku for sku in skus}
+        rows = []
+
+        for sku_id, loc_id in self.solution_.items():
+            sku = sku_map[sku_id]
+            loc = loc_map[loc_id]
+            travel = sku.avg_daily_picks * loc.distance_from_dispatch
+            baseline_travel = None
+            if baseline_assignment and sku_id in baseline_assignment:
+                bl_loc = loc_map.get(baseline_assignment[sku_id])
+                if bl_loc:
+                    baseline_travel = sku.avg_daily_picks * bl_loc.distance_from_dispatch
+            rows.append({
+                "sku_id": sku_id,
+                "sku_class": sku.sku_class,
+                "assigned_location": loc_id,
+                "zone": loc.zone,
+                "daily_picks": sku.avg_daily_picks,
+                "distance_m": loc.distance_from_dispatch,
+                "daily_travel_m": travel,
+                "baseline_travel_m": baseline_travel,
+                "travel_delta_pct": ((travel - baseline_travel) / (baseline_travel + 1e-8) * 100)
+                if baseline_travel else None,
+            })
+
+        return pd.DataFrame(rows)
